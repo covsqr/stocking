@@ -190,6 +190,18 @@ textarea {
   color: var(--muted-foreground);
 }
 
+.mini-badge.market-open {
+  background: rgba(21, 128, 61, 0.08);
+  border-color: rgba(21, 128, 61, 0.28);
+  color: var(--green);
+}
+
+.mini-badge.market-closed {
+  background: rgba(113, 113, 122, 0.08);
+  border-color: rgba(113, 113, 122, 0.24);
+  color: var(--muted-foreground);
+}
+
 .badge.busy {
   color: var(--amber);
   border-color: rgba(161, 98, 7, 0.32);

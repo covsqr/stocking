@@ -88,6 +88,12 @@ function symbolTitle(item) {
   return `${name} · ${symbol}`;
 }
 
+function marketBadge(item) {
+  const label = item?.marketOpen ? "장중" : "장외";
+  const className = item?.marketOpen ? "market-open" : "market-closed";
+  return `<span class="mini-badge ${className}">${label}</span>`;
+}
+
 function renderLive(result) {
   state.lastResult = result;
   setStatus("running");
@@ -170,7 +176,7 @@ function renderPositions(result) {
         <article class="position-card">
           <div>
             <strong>${escapeHtml(item.name)}</strong>
-            <span>${escapeHtml(item.symbol)}</span>
+            <span>${escapeHtml(item.symbol)} ${marketBadge(item)}</span>
           </div>
           <em class="${tone}">${escapeHtml(subtitle)}</em>
           ${miniSparkline(item.points || [], tone)}
@@ -183,11 +189,12 @@ function renderPositions(result) {
     .map((item) => {
       const tone = item.unrealizedPnl >= 0 ? "up" : "down";
       const targetBadge = item.targeted ? "" : `<span class="mini-badge">제외 후보</span>`;
+      const openBadge = marketBadge(item);
       return `
         <tr>
           <td>
             <strong>${escapeHtml(item.name)}</strong>
-            <small>${escapeHtml(item.symbol)} ${targetBadge}</small>
+            <small>${escapeHtml(item.symbol)} ${openBadge} ${targetBadge}</small>
           </td>
           <td>${Number(item.shares).toFixed(4)}</td>
           <td>${money(item.avgCost)}</td>
@@ -225,7 +232,7 @@ function renderQuotes(quotes) {
         <article class="quote-card">
           <div>
             <strong>${escapeHtml(quote.name || quote.symbol)}</strong>
-            <small>${escapeHtml(quote.symbol)}</small>
+            <small>${escapeHtml(quote.symbol)} ${marketBadge(quote)}</small>
           </div>
           <span>${money(quote.price)}</span>
           <em class="${tone}">${signedPct(quote.change)}</em>

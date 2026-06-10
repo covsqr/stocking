@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import random
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -15,6 +15,7 @@ STATE_PATH = ROOT / "data" / "runs" / "live_session.json"
 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 KST = ZoneInfo("Asia/Seoul")
+NY = ZoneInfo("America/New_York")
 FRESH_QUOTE_SECONDS = 2 * 60 * 60
 AUTO_INTERVAL_SECONDS = 5 * 60
 MIN_TRADE_INTERVAL_SECONDS = 30 * 60
@@ -111,22 +112,24 @@ def run_live_step(auto: bool = False) -> dict:
             state["lastCheckedAt"] = checked_at
             state["lastQuoteTime"] = quote_time
             state["lastQuotes"] = {symbol: _quote_public(quote) for symbol, quote in quotes.items()}
+            tradable_symbols = _tradable_symbols(quotes)
+            tradable_timestamp = max((quotes[symbol]["timestamp"] for symbol in tradable_symbols), default=0)
 
             value_before = _portfolio_value(state, quotes)
 
-            if not _quotes_are_fresh(quote_timestamp):
-                status = "장 마감 또는 오래된 시세입니다. 자동매매 판단을 보류했습니다."
+            if not tradable_symbols:
+                status = "거래 가능한 장중 종목이 없어 자동매매 판단을 보류했습니다."
                 state["lastStatus"] = status
                 state["lastDecision"] = _decision_summary(checked_at, quote_time, "보류", 0, 0.0, status)
-                _record_status_once(state, quote_timestamp, f"{checked_at} 확인: 시세 기준 {quote_time}, 신규 체결 없음")
+                _record_status_once(state, quote_timestamp, f"{checked_at} 확인: 장외 종목만 감지, 신규 체결 없음")
                 _save(state)
                 return _public_state(state)
 
-            if state.get("lastMarketTimestamp") == quote_timestamp:
+            if state.get("lastMarketTimestamp") == tradable_timestamp:
                 status = "이전 판단 이후 새 시세가 없어 대기 중입니다."
                 state["lastStatus"] = status
                 state["lastDecision"] = _decision_summary(checked_at, quote_time, "대기", 0, 0.0, status)
-                _record_status_once(state, quote_timestamp, f"{checked_at} 확인: 아직 새 시세 없음")
+                _record_status_once(state, tradable_timestamp, f"{checked_at} 확인: 장중 종목 새 시세 없음")
                 _save(state)
                 return _public_state(state)
 
@@ -159,8 +162,8 @@ def run_live_step(auto: bool = False) -> dict:
                 action = 0
                 forced_reason = f"거래 쿨다운 {max(1, (trade_remaining + 59) // 60)}분 남음"
 
-            target_weights = _target_weights_for_action(state, quotes, action, value_before)
-            trades = _rebalance(state, quotes, target_weights, value_before, checked_at, quote_time)
+            target_weights = _target_weights_for_action(state, quotes, action, value_before, tradable_symbols)
+            trades = _rebalance(state, quotes, target_weights, value_before, checked_at, quote_time, tradable_symbols)
             value_after = _portfolio_value(state, quotes)
             trade_cost_rate = max(0.0, (value_before - value_after) / max(value_before, 1e-9)) if trades else 0.0
             if trades:
@@ -168,6 +171,7 @@ def run_live_step(auto: bool = False) -> dict:
 
             action_label = _action_label(action, trades)
             status_bits = [f"새 시세 반영 완료: {action_label}", f"체결 {len(trades)}건"]
+            status_bits.append(f"장중 거래 가능 {len(tradable_symbols)}/{len(state['symbols'])}개")
             if forced_reason:
                 status_bits.append(forced_reason)
             status = ", ".join(status_bits)
@@ -177,7 +181,7 @@ def run_live_step(auto: bool = False) -> dict:
             state["lastAction"] = action
             state["lastValue"] = value_after
             state["lastTradeCostRate"] = trade_cost_rate
-            state["lastMarketTimestamp"] = quote_timestamp
+            state["lastMarketTimestamp"] = tradable_timestamp
             state["lastStatus"] = status
             state["peakValue"] = max(float(state.get("peakValue", value_after)), value_after)
             state["epsilon"] = max(EPSILON_FLOOR, float(state.get("epsilon", _initial_epsilon(state))) * EPSILON_DECAY)
@@ -455,9 +459,11 @@ def _target_weights_for_action(
     quotes: dict[str, dict],
     action: int,
     total_value: float,
+    tradable_symbols: set[str] | None = None,
 ) -> dict[str, float]:
     max_weight = PROFILE_SETTINGS[state["profile"]]["max_weight"]
-    investable = set(state.get("targetUniverse") or state["symbols"])
+    tradable_symbols = set(quotes.keys()) if tradable_symbols is None else set(tradable_symbols)
+    investable = set(state.get("targetUniverse") or state["symbols"]) & tradable_symbols
     ranked = sorted(
         [quote for quote in quotes.values() if quote["symbol"] in investable],
         key=lambda item: item["change"],
@@ -494,13 +500,17 @@ def _rebalance(
     total_value: float,
     checked_at: str,
     quote_time: str,
+    tradable_symbols: set[str] | None = None,
 ) -> list[dict]:
     settings = PROFILE_SETTINGS[state["profile"]]
     current = _current_weights(state, quotes, total_value)
     trades = []
     fee_rate = 0.0005
     slippage_rate = 0.0005
+    tradable_symbols = set(quotes.keys()) if tradable_symbols is None else set(tradable_symbols)
     for symbol in state["symbols"]:
+        if symbol not in tradable_symbols:
+            continue
         target = target_weights.get(symbol, 0.0)
         diff_value = (target - current.get(symbol, 0.0)) * total_value
         if abs(diff_value) / max(total_value, 1e-9) < settings["trade_threshold"]:
@@ -609,9 +619,12 @@ def _latest_time(quotes: dict[str, dict]) -> str:
 
 
 def _quote_public(quote: dict) -> dict:
+    market_open = _is_symbol_tradable(quote["symbol"], quote)
     return {
         "symbol": quote["symbol"],
         "name": quote.get("name") or get_symbol_name(quote["symbol"]),
+        "market": _symbol_market(quote["symbol"]),
+        "marketOpen": market_open,
         "time": quote["time"],
         "timestamp": quote["timestamp"],
         "checkedAt": quote.get("checkedAt"),
@@ -620,6 +633,31 @@ def _quote_public(quote: dict) -> dict:
         "volume": quote["volume"],
         "points": quote.get("points", []),
     }
+
+
+def _tradable_symbols(quotes: dict[str, dict]) -> set[str]:
+    return {symbol for symbol, quote in quotes.items() if _is_symbol_tradable(symbol, quote)}
+
+
+def _is_symbol_tradable(symbol: str, quote: dict) -> bool:
+    timestamp = int(quote.get("timestamp") or 0)
+    if not _quotes_are_fresh(timestamp):
+        return False
+    quote_dt = datetime.fromtimestamp(timestamp, tz=KST)
+    market = _symbol_market(symbol)
+    if market == "KR":
+        return quote_dt.weekday() < 5 and time(9, 0) <= quote_dt.time() <= time(15, 30)
+    if market == "US":
+        ny_dt = quote_dt.astimezone(NY)
+        return ny_dt.weekday() < 5 and time(9, 30) <= ny_dt.time() <= time(16, 0)
+    return False
+
+
+def _symbol_market(symbol: str) -> str:
+    upper = symbol.upper()
+    if upper.endswith(".KS") or upper.endswith(".KQ"):
+        return "KR"
+    return "US"
 
 
 def _positions_public(state: dict, quotes: dict[str, dict], total_value: float) -> list[dict]:
@@ -649,6 +687,8 @@ def _positions_public(state: dict, quotes: dict[str, dict], total_value: float) 
                 "unrealizedPnlRate": round(pnl_rate, 6),
                 "points": quote.get("points", [])[-40:],
                 "targeted": symbol in targets,
+                "market": quote.get("market") or _symbol_market(symbol),
+                "marketOpen": bool(quote.get("marketOpen", False)),
             }
         )
     positions.sort(key=lambda item: item["value"], reverse=True)
