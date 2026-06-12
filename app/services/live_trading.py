@@ -7,7 +7,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from app.services.market_data import get_latest_quotes, get_symbol_name, suggest_symbols, validate_symbols
+from app.services.market_data import get_latest_quotes, get_symbol_name, get_usd_krw_rate, suggest_symbols, validate_symbols
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -23,7 +23,7 @@ MIN_POSITION_HOLD_SECONDS = 2 * 60 * 60
 REENTRY_COOLDOWN_SECONDS = 2 * 60 * 60
 RISK_STOP_COOLDOWN_SECONDS = 2 * 60 * 60
 SYMBOL_ROTATION_SECONDS = 6 * 60 * 60
-POLICY_VERSION = 4
+POLICY_VERSION = 5
 EPSILON_DECAY = 0.997
 EPSILON_FLOOR = 0.02
 POLICY_DRAWDOWN_LIMIT = -0.05
@@ -41,9 +41,9 @@ DEFAULT_SESSION = {
 }
 
 PROFILE_SETTINGS = {
-    "stable": {"max_weight": 0.25, "trade_threshold": 0.04, "risk_penalty": 1.2, "epsilon": 0.06},
-    "balanced": {"max_weight": 0.35, "trade_threshold": 0.025, "risk_penalty": 0.8, "epsilon": 0.08},
-    "aggressive": {"max_weight": 0.55, "trade_threshold": 0.015, "risk_penalty": 0.45, "epsilon": 0.10},
+    "stable": {"max_weight": 0.35, "trade_threshold": 0.04, "risk_penalty": 1.2, "epsilon": 0.06, "cash_reserve": 0.15},
+    "balanced": {"max_weight": 0.45, "trade_threshold": 0.025, "risk_penalty": 0.8, "epsilon": 0.08, "cash_reserve": 0.08},
+    "aggressive": {"max_weight": 0.65, "trade_threshold": 0.015, "risk_penalty": 0.45, "epsilon": 0.10, "cash_reserve": 0.03},
 }
 
 ACTION_LABELS = {
@@ -110,7 +110,7 @@ def run_live_step(auto: bool = False) -> dict:
 
             checked_at = _now_text()
             _maybe_rotate_symbols(state, checked_at)
-            quotes = get_latest_quotes(state["symbols"])
+            quotes = _quotes_in_base_currency(get_latest_quotes(state["symbols"]), state)
             quote_timestamp = max(quote["timestamp"] for quote in quotes.values())
             quote_time = _latest_time(quotes)
             state["lastCheckedAt"] = checked_at
@@ -339,6 +339,7 @@ def _migrate(state: dict) -> dict:
     state.setdefault("rotationLastAt", None)
     state.setdefault("rotationCandidates", [])
     state.setdefault("targetUniverse", state["symbols"])
+    _migrate_currency_units(state)
     state["autoIntervalSeconds"] = AUTO_INTERVAL_SECONDS
     state["messages"] = state["messages"][:50]
     state.setdefault(
@@ -384,6 +385,91 @@ def _rebuild_missing_symbol_timestamps(state: dict) -> None:
     for symbol, holding in state.get("holdings", {}).items():
         if float(holding.get("shares", 0.0)) > 0 and not buy_times.get(symbol):
             buy_times[symbol] = state.get("lastTradeAt") or _now_text()
+
+
+def _migrate_currency_units(state: dict) -> None:
+    if int(state.get("currencyVersion", 0) or 0) >= 2:
+        state["lastQuotes"] = _quotes_in_base_currency(state.get("lastQuotes", {}), state)
+        return
+
+    fx_rate = _usd_krw_rate(state)
+    for trade in state.get("trades", []):
+        if _symbol_currency(trade.get("symbol", "")) == "USD":
+            _migrate_usd_trade(trade, fx_rate)
+
+    for symbol, holding in state.get("holdings", {}).items():
+        if _symbol_currency(symbol) != "USD":
+            continue
+        avg_cost = float(holding.get("avgCost", 0.0) or 0.0)
+        shares = float(holding.get("shares", 0.0) or 0.0)
+        if shares > 0 and 0 < avg_cost < 10000:
+            holding["shares"] = shares / fx_rate
+            holding["avgCost"] = avg_cost * fx_rate
+
+    state["lastQuotes"] = _quotes_in_base_currency(state.get("lastQuotes", {}), state)
+    state["currencyVersion"] = 2
+    state["baseCurrency"] = "KRW"
+    state["lastValue"] = _portfolio_value(state, state.get("lastQuotes", {}))
+    state["peakValue"] = max(float(state.get("peakValue", state["lastValue"])), state["lastValue"])
+    state["policyBaselineValue"] = state.get("policyBaselineValue", state["initialCash"])
+    _add_message(state, f"{_now_text()} currency fix: USD prices are now converted to KRW for portfolio accounting")
+
+
+def _migrate_usd_trade(trade: dict, fx_rate: float) -> None:
+    if trade.get("sourceCurrency") == "USD":
+        return
+    price = float(trade.get("price", 0.0) or 0.0)
+    market_price = float(trade.get("marketPrice", price) or price)
+    if not 0 < price < 10000:
+        return
+    trade["sourceCurrency"] = "USD"
+    trade["sourcePrice"] = round(price, 4)
+    trade["fxRate"] = round(fx_rate, 4)
+    trade["baseCurrency"] = "KRW"
+    trade["price"] = round(price * fx_rate, 4)
+    trade["marketPrice"] = round(market_price * fx_rate, 4)
+    trade["shares"] = round(float(trade.get("shares", 0.0) or 0.0) / fx_rate, 6)
+
+
+def _quotes_in_base_currency(quotes: dict[str, dict], state: dict) -> dict[str, dict]:
+    fx_rate = _usd_krw_rate(state)
+    return {symbol: _quote_in_base_currency(quote, fx_rate) for symbol, quote in quotes.items()}
+
+
+def _quote_in_base_currency(quote: dict, fx_rate: float) -> dict:
+    symbol = quote["symbol"]
+    currency = quote.get("sourceCurrency") or _symbol_currency(symbol)
+    source_price = float(quote.get("sourcePrice", quote.get("price", 0.0)) or 0.0)
+    multiplier = fx_rate if currency == "USD" else 1.0
+    converted = dict(quote)
+    converted["sourceCurrency"] = currency
+    converted["baseCurrency"] = "KRW"
+    converted["sourcePrice"] = round(source_price, 4)
+    converted["fxRate"] = round(float(fx_rate), 4) if currency == "USD" else 1.0
+    converted["price"] = round(source_price * multiplier, 4)
+    converted["points"] = [_point_in_base_currency(point, currency, multiplier) for point in quote.get("points", [])]
+    return converted
+
+
+def _point_in_base_currency(point: dict, currency: str, multiplier: float) -> dict:
+    source_price = float(point.get("sourcePrice", point.get("price", 0.0)) or 0.0)
+    converted = dict(point)
+    converted["sourcePrice"] = round(source_price, 4)
+    converted["sourceCurrency"] = currency
+    converted["baseCurrency"] = "KRW"
+    converted["price"] = round(source_price * multiplier, 4)
+    return converted
+
+
+def _usd_krw_rate(state: dict) -> float:
+    try:
+        rate = float(get_usd_krw_rate())
+    except Exception:
+        rate = float(state.get("lastFxRate") or 1350.0)
+    if not 500 <= rate <= 3000:
+        rate = float(state.get("lastFxRate") or 1350.0)
+    state["lastFxRate"] = round(rate, 4)
+    return rate
 
 
 def _maybe_rotate_symbols(state: dict, checked_at: str) -> None:
@@ -493,7 +579,9 @@ def _target_weights_for_action(
     total_value: float,
     tradable_symbols: set[str] | None = None,
 ) -> dict[str, float]:
-    max_weight = PROFILE_SETTINGS[state["profile"]]["max_weight"]
+    settings = PROFILE_SETTINGS[state["profile"]]
+    max_weight = settings["max_weight"]
+    investment_target = 1.0 - settings.get("cash_reserve", 0.08)
     tradable_symbols = set(quotes.keys()) if tradable_symbols is None else set(tradable_symbols)
     investable = set(state.get("targetUniverse") or state["symbols"]) & tradable_symbols
     ranked = sorted(
@@ -502,25 +590,50 @@ def _target_weights_for_action(
         reverse=True,
     )
     if action in (0, 1):
-        return _current_weights(state, quotes, total_value)
-    if action == 2:
-        raw = {item["symbol"]: 1.0 for item in ranked[:1] if item["change"] > -0.003}
+        cash_weight = float(state.get("cash", 0.0)) / max(total_value, 1e-9)
+        if cash_weight <= settings.get("cash_reserve", 0.08) + settings["trade_threshold"]:
+            return _current_weights(state, quotes, total_value)
+        raw = _deployment_candidates(ranked, investable)
+    elif action == 2:
+        raw = {item["symbol"]: 1.0 for item in ranked[:2] if item["change"] > -0.003}
     elif action == 3:
-        raw = {item["symbol"]: max(0.001, item["change"] + 0.01) for item in ranked[:3] if item["change"] > -0.006}
+        raw = {item["symbol"]: max(0.001, item["change"] + 0.01) for item in ranked[:4] if item["change"] > -0.006}
     else:
         raw = {symbol: 1.0 for symbol in state["symbols"] if symbol in investable}
-    return _normalize(raw, max_weight)
+    return _normalize(raw, max_weight, investment_target)
 
 
-def _normalize(raw: dict[str, float], max_weight: float) -> dict[str, float]:
+def _deployment_candidates(ranked: list[dict], investable: set[str]) -> dict[str, float]:
+    raw = {item["symbol"]: max(0.001, item["change"] + 0.01) for item in ranked[:4] if item["change"] > -0.006}
+    if raw:
+        return raw
+    return {item["symbol"]: 1.0 for item in ranked[:4] if item["symbol"] in investable}
+
+
+def _normalize(raw: dict[str, float], max_weight: float, investment_target: float = 1.0) -> dict[str, float]:
     if not raw:
         return {}
-    total = sum(max(0.0, value) for value in raw.values())
-    if total <= 0:
+    active = {symbol: max(0.0, value) for symbol, value in raw.items() if value > 0}
+    if not active:
         return {}
-    weights = {symbol: min(max_weight, max(0.0, value) / total) for symbol, value in raw.items()}
-    scale = min(1.0, 1.0 / max(sum(weights.values()), 1e-9))
-    return {symbol: value * scale for symbol, value in weights.items()}
+    target = min(1.0, max(0.0, investment_target))
+    weights: dict[str, float] = {}
+    remaining = target
+    while active and remaining > 1e-9:
+        total = sum(active.values())
+        capped = []
+        proposals = {symbol: remaining * value / max(total, 1e-9) for symbol, value in active.items()}
+        for symbol, proposed in proposals.items():
+            if proposed >= max_weight:
+                weights[symbol] = max_weight
+                capped.append(symbol)
+        if not capped:
+            weights.update(proposals)
+            break
+        for symbol in capped:
+            active.pop(symbol, None)
+        remaining = target - sum(weights.values())
+    return weights
 
 
 def _rebalance(
@@ -590,6 +703,10 @@ def _rebalance(
             "shares": round(shares, 6),
             "price": round(execution_price, 4),
             "marketPrice": round(price, 4),
+            "sourceCurrency": quotes[symbol].get("sourceCurrency", "KRW"),
+            "sourcePrice": round(float(quotes[symbol].get("sourcePrice", price)), 4),
+            "fxRate": round(float(quotes[symbol].get("fxRate", 1.0)), 4),
+            "baseCurrency": "KRW",
             "value": round(trade_value, 2),
             "fee": round(fee, 2),
             "realizedPnl": round(realized, 2),
@@ -695,6 +812,10 @@ def _quote_public(quote: dict) -> dict:
         "timestamp": quote["timestamp"],
         "checkedAt": quote.get("checkedAt"),
         "price": quote["price"],
+        "sourceCurrency": quote.get("sourceCurrency", _symbol_currency(quote["symbol"])),
+        "sourcePrice": quote.get("sourcePrice", quote["price"]),
+        "fxRate": quote.get("fxRate", 1.0),
+        "baseCurrency": quote.get("baseCurrency", "KRW"),
         "change": quote["change"],
         "volume": quote["volume"],
         "points": quote.get("points", []),
@@ -726,6 +847,10 @@ def _symbol_market(symbol: str) -> str:
     return "US"
 
 
+def _symbol_currency(symbol: str) -> str:
+    return "KRW" if _symbol_market(symbol) == "KR" else "USD"
+
+
 def _positions_public(state: dict, quotes: dict[str, dict], total_value: float) -> list[dict]:
     positions = []
     targets = set(state.get("targetUniverse") or state["symbols"])
@@ -735,6 +860,9 @@ def _positions_public(state: dict, quotes: dict[str, dict], total_value: float) 
         shares = float(holding.get("shares", 0.0))
         avg_cost = float(holding.get("avgCost", 0.0))
         price = float(quote.get("price", 0.0) or 0.0)
+        source_currency = quote.get("sourceCurrency") or _symbol_currency(symbol)
+        fx_rate = float(quote.get("fxRate", 1.0) or 1.0)
+        source_price = float(quote.get("sourcePrice", price) or 0.0)
         value = shares * price
         cost = shares * avg_cost
         pnl = value - cost if shares and avg_cost else 0.0
@@ -745,7 +873,12 @@ def _positions_public(state: dict, quotes: dict[str, dict], total_value: float) 
                 "name": quote.get("name") or get_symbol_name(symbol),
                 "shares": round(shares, 6),
                 "avgCost": round(avg_cost, 4),
+                "sourceAvgCost": round(avg_cost / fx_rate, 4) if source_currency == "USD" and fx_rate else round(avg_cost, 4),
                 "price": round(price, 4),
+                "sourcePrice": round(source_price, 4),
+                "sourceCurrency": source_currency,
+                "fxRate": round(fx_rate, 4),
+                "baseCurrency": quote.get("baseCurrency", "KRW"),
                 "value": round(value, 2),
                 "cost": round(cost, 2),
                 "weight": round(value / max(total_value, 1e-9), 6),
@@ -843,6 +976,8 @@ def _public_state(state: dict) -> dict:
         "lastQuoteTime": state.get("lastQuoteTime"),
         "lastStatus": state.get("lastStatus"),
         "lastDecision": state.get("lastDecision"),
+        "baseCurrency": "KRW",
+        "lastFxRate": state.get("lastFxRate"),
         "autoIntervalSeconds": AUTO_INTERVAL_SECONDS,
         "minTradeIntervalSeconds": MIN_TRADE_INTERVAL_SECONDS,
         "minPositionHoldSeconds": MIN_POSITION_HOLD_SECONDS,
@@ -850,6 +985,7 @@ def _public_state(state: dict) -> dict:
         "riskStopCooldownSeconds": RISK_STOP_COOLDOWN_SECONDS,
         "symbolRotationSeconds": SYMBOL_ROTATION_SECONDS,
         "policyVersion": state.get("policyVersion", POLICY_VERSION),
+        "targetCashReserve": PROFILE_SETTINGS[state["profile"]].get("cash_reserve", 0.08),
         "rotation": {
             "enabled": bool(state.get("autoRotateSymbols", True)),
             "market": state.get("autoMarket", "mixed"),

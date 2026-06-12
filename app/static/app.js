@@ -76,6 +76,15 @@ function money(value) {
   return Math.round(Number(value)).toLocaleString("ko-KR");
 }
 
+function priceMoney(item, field = "price", sourceField = "sourcePrice") {
+  if (!item || item[field] === undefined || item[field] === null) return "-";
+  const krw = `KRW ${money(item[field])}`;
+  if (item.sourceCurrency === "USD" && item[sourceField] !== undefined && item[sourceField] !== null) {
+    return `USD ${Number(item[sourceField]).toLocaleString("en-US", { maximumFractionDigits: 2 })} / ${krw}`;
+  }
+  return krw;
+}
+
 function signedMoney(value) {
   if (value === undefined || value === null || Number.isNaN(Number(value))) return "-";
   const number = Math.round(Number(value));
@@ -197,8 +206,8 @@ function renderPositions(result) {
             <small>${escapeHtml(item.symbol)} ${openBadge} ${targetBadge}</small>
           </td>
           <td>${Number(item.shares).toFixed(4)}</td>
-          <td>${money(item.avgCost)}</td>
-          <td>${money(item.price)}</td>
+          <td>${priceMoney(item, "avgCost", "sourceAvgCost")}</td>
+          <td>${priceMoney(item)}</td>
           <td>${money(item.value)}</td>
           <td class="${tone}">${signedPct(item.unrealizedPnlRate)} (${signedMoney(item.unrealizedPnl)})</td>
         </tr>
@@ -234,7 +243,7 @@ function renderQuotes(quotes) {
             <strong>${escapeHtml(quote.name || quote.symbol)}</strong>
             <small>${escapeHtml(quote.symbol)} ${marketBadge(quote)}</small>
           </div>
-          <span>${money(quote.price)}</span>
+          <span>${priceMoney(quote)}</span>
           <em class="${tone}">${signedPct(quote.change)}</em>
           <small>시세 ${escapeHtml(quote.time || "-")}</small>
         </article>
@@ -283,7 +292,7 @@ function renderTrades(trades, result) {
           <td><strong>${escapeHtml(name)}</strong><small>${escapeHtml(trade.symbol)}</small></td>
           <td class="${sideClass}">${trade.side}</td>
           <td>${Number(trade.shares).toFixed(4)}</td>
-          <td>${money(trade.price)}</td>
+          <td>${priceMoney(trade)}</td>
           <td>${money(trade.value)}</td>
           <td>${signedMoney(trade.realizedPnl)}</td>
         </tr>

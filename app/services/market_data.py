@@ -17,6 +17,9 @@ ROOT = Path(__file__).resolve().parents[2]
 CACHE_DIR = ROOT / "data" / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 KST = ZoneInfo("Asia/Seoul")
+FX_CACHE_PATH = CACHE_DIR / "usd_krw_rate.json"
+FALLBACK_USD_KRW = 1350.0
+FX_CACHE_SECONDS = 30 * 60
 
 
 DEFAULT_CANDIDATES = {
@@ -113,6 +116,45 @@ def normalize_symbol(symbol: str) -> str:
 def get_symbol_name(symbol: str) -> str:
     symbol = normalize_symbol(symbol)
     return SYMBOL_NAMES.get(symbol, symbol)
+
+
+def get_usd_krw_rate() -> float:
+    cached = _read_cached_usd_krw(max_age_seconds=FX_CACHE_SECONDS)
+    if cached:
+        return cached
+    try:
+        points = get_intraday_points("KRW=X", range_text="5d", interval="5m")
+        rate = float(points[-1]["price"])
+        if 500 <= rate <= 3000:
+            _write_cached_usd_krw(rate)
+            return rate
+    except Exception:
+        cached = _read_cached_usd_krw(max_age_seconds=None)
+        if cached:
+            return cached
+    return FALLBACK_USD_KRW
+
+
+def _read_cached_usd_krw(max_age_seconds: int | None) -> float | None:
+    if not FX_CACHE_PATH.exists():
+        return None
+    try:
+        payload = json.loads(FX_CACHE_PATH.read_text(encoding="utf-8"))
+        if max_age_seconds is not None:
+            age = time.time() - float(payload.get("savedAt", 0))
+            if age > max_age_seconds:
+                return None
+        rate = float(payload.get("rate", 0))
+        return rate if 500 <= rate <= 3000 else None
+    except Exception:
+        return None
+
+
+def _write_cached_usd_krw(rate: float) -> None:
+    FX_CACHE_PATH.write_text(
+        json.dumps({"rate": round(float(rate), 4), "savedAt": time.time()}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def validate_symbols(symbols: list[str]) -> list[str]:

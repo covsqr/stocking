@@ -63,6 +63,15 @@ POST /api/backtest
 POST /api/train
 POST /api/advice
 ```
+## Currency and allocation policy v5
+
+- Live portfolio accounting is KRW-based.
+- `_quotes_in_base_currency` converts USD quotes into KRW while preserving `sourcePrice`, `sourceCurrency`, and `fxRate`.
+- `_migrate_currency_units` fixes existing open US holdings by multiplying average cost by USD/KRW and dividing share count by USD/KRW.
+- Existing US trade rows are migrated the same way so the ledger no longer displays USD prices as KRW prices.
+- `get_usd_krw_rate` fetches Yahoo `KRW=X`, caches it for 30 minutes, then falls back to the latest cache or `1350.0`.
+- Profile settings include `cash_reserve`; balanced mode keeps about 8% cash and invests the rest when candidates are available.
+
 ## Safety policy v4
 
 - `ACTION_CASH` preserves current weights instead of targeting zero exposure.

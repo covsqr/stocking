@@ -41,6 +41,14 @@ python run.py
 ## 주의
 
 이 앱은 실제 주문을 내지 않는 실험용 모의투자 도구입니다. 현재 구현은 단순 Q-learning baseline이며, 실전 투자 조언이나 수익 보장을 제공하지 않습니다.
+## Currency and allocation policy v5
+
+- The account base currency is KRW.
+- US stock quotes keep both `sourcePrice` in USD and `price` converted to KRW.
+- Open US stock holdings and old US trade rows are migrated from raw USD-like units into KRW accounting units.
+- USD/KRW is fetched from Yahoo `KRW=X` and cached for 30 minutes, with a fallback only if network lookup fails.
+- Balanced mode targets about 92% invested and 8% cash reserve when enough tradable symbols are available.
+
 ## Safety policy v4
 
 - Cash-wait decisions no longer liquidate existing positions.
