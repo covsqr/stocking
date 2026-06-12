@@ -19,12 +19,16 @@ NY = ZoneInfo("America/New_York")
 FRESH_QUOTE_SECONDS = 2 * 60 * 60
 AUTO_INTERVAL_SECONDS = 5 * 60
 MIN_TRADE_INTERVAL_SECONDS = 30 * 60
+MIN_POSITION_HOLD_SECONDS = 2 * 60 * 60
+REENTRY_COOLDOWN_SECONDS = 2 * 60 * 60
 RISK_STOP_COOLDOWN_SECONDS = 2 * 60 * 60
 SYMBOL_ROTATION_SECONDS = 6 * 60 * 60
-POLICY_VERSION = 3
+POLICY_VERSION = 4
 EPSILON_DECAY = 0.997
 EPSILON_FLOOR = 0.02
 POLICY_DRAWDOWN_LIMIT = -0.05
+PROFIT_EXIT_BUFFER = 0.003
+STOP_LOSS_LIMIT = -0.025
 
 STATE_LOCK = threading.RLock()
 STEP_LOCK = threading.Lock()
@@ -172,6 +176,8 @@ def run_live_step(auto: bool = False) -> dict:
             action_label = _action_label(action, trades)
             status_bits = [f"새 시세 반영 완료: {action_label}", f"체결 {len(trades)}건"]
             status_bits.append(f"장중 거래 가능 {len(tradable_symbols)}/{len(state['symbols'])}개")
+            if state.get("lastTradeGuards"):
+                status_bits.append(f"보호 규칙으로 {len(state['lastTradeGuards'])}건 보류")
             if forced_reason:
                 status_bits.append(forced_reason)
             status = ", ".join(status_bits)
@@ -249,6 +255,9 @@ def _new_state(payload: dict) -> dict:
         "policyBaselineValue": initial_cash,
         "peakValue": initial_cash,
         "lastTradeAt": None,
+        "lastSymbolBuyAt": {},
+        "lastSymbolSellAt": {},
+        "lastTradeGuards": [],
         "riskStopUntil": None,
         "lastRiskStopAt": None,
         "lastTradeCostRate": 0.0,
@@ -317,6 +326,10 @@ def _migrate(state: dict) -> dict:
     state.setdefault("policyBaselineValue", current_value)
     state.setdefault("peakValue", current_value)
     state.setdefault("lastTradeAt", None)
+    state.setdefault("lastSymbolBuyAt", {})
+    state.setdefault("lastSymbolSellAt", {})
+    _rebuild_missing_symbol_timestamps(state)
+    state.setdefault("lastTradeGuards", [])
     state.setdefault("riskStopUntil", None)
     state.setdefault("lastRiskStopAt", None)
     state.setdefault("lastTradeCostRate", 0.0)
@@ -352,6 +365,25 @@ def _save(state: dict) -> None:
     with temp_path.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     temp_path.replace(STATE_PATH)
+
+
+def _rebuild_missing_symbol_timestamps(state: dict) -> None:
+    buy_times = state.setdefault("lastSymbolBuyAt", {})
+    sell_times = state.setdefault("lastSymbolSellAt", {})
+    if buy_times and sell_times:
+        return
+    for trade in state.get("trades", []):
+        symbol = trade.get("symbol")
+        trade_time = trade.get("time")
+        if not symbol or not trade_time:
+            continue
+        if trade.get("side") == "BUY":
+            buy_times[symbol] = trade_time
+        elif trade.get("side") == "SELL":
+            sell_times[symbol] = trade_time
+    for symbol, holding in state.get("holdings", {}).items():
+        if float(holding.get("shares", 0.0)) > 0 and not buy_times.get(symbol):
+            buy_times[symbol] = state.get("lastTradeAt") or _now_text()
 
 
 def _maybe_rotate_symbols(state: dict, checked_at: str) -> None:
@@ -469,11 +501,9 @@ def _target_weights_for_action(
         key=lambda item: item["change"],
         reverse=True,
     )
-    if action == 0:
+    if action in (0, 1):
         return _current_weights(state, quotes, total_value)
-    if action == 1:
-        raw = {}
-    elif action == 2:
+    if action == 2:
         raw = {item["symbol"]: 1.0 for item in ranked[:1] if item["change"] > -0.003}
     elif action == 3:
         raw = {item["symbol"]: max(0.001, item["change"] + 0.01) for item in ranked[:3] if item["change"] > -0.006}
@@ -505,6 +535,7 @@ def _rebalance(
     settings = PROFILE_SETTINGS[state["profile"]]
     current = _current_weights(state, quotes, total_value)
     trades = []
+    state["lastTradeGuards"] = []
     fee_rate = 0.0005
     slippage_rate = 0.0005
     tradable_symbols = set(quotes.keys()) if tradable_symbols is None else set(tradable_symbols)
@@ -518,6 +549,9 @@ def _rebalance(
         price = float(quotes[symbol]["price"])
         holding = state["holdings"][symbol]
         if diff_value > 0:
+            if not _can_buy_symbol(state, symbol):
+                state["lastTradeGuards"].append({"symbol": symbol, "side": "BUY", "reason": "reentry_cooldown"})
+                continue
             execution_price = price * (1 + slippage_rate)
             trade_value = min(diff_value, state["cash"] / (1 + fee_rate))
             if trade_value <= 0:
@@ -530,6 +564,7 @@ def _rebalance(
             state["cash"] -= trade_value + fee
             side = "BUY"
             realized = 0.0
+            state.setdefault("lastSymbolBuyAt", {})[symbol] = checked_at
         else:
             execution_price = price * (1 - slippage_rate)
             shares = min(holding["shares"], abs(diff_value) / execution_price)
@@ -538,11 +573,15 @@ def _rebalance(
             trade_value = shares * execution_price
             fee = trade_value * fee_rate
             realized = (execution_price - holding["avgCost"]) * shares - fee
+            if not _can_sell_symbol(state, symbol, checked_at, realized, shares):
+                state["lastTradeGuards"].append({"symbol": symbol, "side": "SELL", "reason": "hold_or_loss_guard"})
+                continue
             holding["shares"] = max(0.0, holding["shares"] - shares)
             if holding["shares"] == 0:
                 holding["avgCost"] = 0.0
             state["cash"] += trade_value - fee
             side = "SELL"
+            state.setdefault("lastSymbolSellAt", {})[symbol] = checked_at
         trade = {
             "time": checked_at,
             "quoteTime": quote_time,
@@ -558,6 +597,33 @@ def _rebalance(
         state["trades"].append(trade)
         trades.append(trade)
     return trades
+
+
+def _can_buy_symbol(state: dict, symbol: str) -> bool:
+    last_sell = _parse_kst_text(state.get("lastSymbolSellAt", {}).get(symbol))
+    if not last_sell:
+        return True
+    elapsed = (datetime.now(KST) - last_sell).total_seconds()
+    return elapsed >= REENTRY_COOLDOWN_SECONDS
+
+
+def _can_sell_symbol(state: dict, symbol: str, checked_at: str, realized: float, shares: float) -> bool:
+    holding = state["holdings"].get(symbol, {})
+    avg_cost = float(holding.get("avgCost", 0.0))
+    cost = avg_cost * max(float(shares), 0.0)
+    if cost <= 0:
+        return True
+
+    realized_rate = realized / cost
+    if realized_rate <= STOP_LOSS_LIMIT:
+        return True
+
+    buy_time = _parse_kst_text(state.get("lastSymbolBuyAt", {}).get(symbol))
+    checked_time = _parse_kst_text(checked_at) or datetime.now(KST)
+    if buy_time and (checked_time - buy_time).total_seconds() < MIN_POSITION_HOLD_SECONDS:
+        return False
+
+    return realized_rate >= PROFIT_EXIT_BUFFER
 
 
 def _initial_epsilon(state: dict) -> float:
@@ -779,6 +845,8 @@ def _public_state(state: dict) -> dict:
         "lastDecision": state.get("lastDecision"),
         "autoIntervalSeconds": AUTO_INTERVAL_SECONDS,
         "minTradeIntervalSeconds": MIN_TRADE_INTERVAL_SECONDS,
+        "minPositionHoldSeconds": MIN_POSITION_HOLD_SECONDS,
+        "reentryCooldownSeconds": REENTRY_COOLDOWN_SECONDS,
         "riskStopCooldownSeconds": RISK_STOP_COOLDOWN_SECONDS,
         "symbolRotationSeconds": SYMBOL_ROTATION_SECONDS,
         "policyVersion": state.get("policyVersion", POLICY_VERSION),
@@ -808,5 +876,6 @@ def _public_state(state: dict) -> dict:
         "quotes": quotes,
         "equityCurve": state["equityCurve"],
         "trades": state["trades"],
+        "tradeGuards": state.get("lastTradeGuards", []),
         "messages": state["messages"],
     }

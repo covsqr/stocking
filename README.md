@@ -41,3 +41,9 @@ python run.py
 ## 주의
 
 이 앱은 실제 주문을 내지 않는 실험용 모의투자 도구입니다. 현재 구현은 단순 Q-learning baseline이며, 실전 투자 조언이나 수익 보장을 제공하지 않습니다.
+## Safety policy v4
+
+- Cash-wait decisions no longer liquidate existing positions.
+- Positions must be held for at least 2 hours before normal profit-taking.
+- Small losing exits are blocked; sells are allowed at +0.3% or better, or at -2.5% stop-loss or worse.
+- A symbol cannot be bought again for 2 hours after it is sold.

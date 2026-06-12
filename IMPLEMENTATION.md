@@ -63,3 +63,10 @@ POST /api/backtest
 POST /api/train
 POST /api/advice
 ```
+## Safety policy v4
+
+- `ACTION_CASH` preserves current weights instead of targeting zero exposure.
+- `_rebalance` blocks normal sells until the position has been held for 2 hours.
+- `_rebalance` only allows profit exits at `+0.3%` or better and stop-loss exits at `-2.5%` or worse.
+- `lastSymbolBuyAt` and `lastSymbolSellAt` are tracked and migrated from the ledger.
+- Re-entry into a just-sold symbol is blocked for 2 hours.
