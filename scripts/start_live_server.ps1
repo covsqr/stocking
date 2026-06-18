@@ -19,9 +19,10 @@ if ($Existing) {
     exit 0
 }
 
-$Python = (Get-Command python).Source
 Write-WatchdogLog "starting server on port $Port"
-Start-Process -FilePath $Python `
+$Process = Start-Process -FilePath "python" `
     -ArgumentList "run.py" `
     -WorkingDirectory $Root `
-    -WindowStyle Hidden
+    -WindowStyle Hidden `
+    -PassThru
+Write-WatchdogLog "server start requested pid=$($Process.Id)"
